@@ -86,7 +86,7 @@ class LeRobotDatasetMetadata:
     ):
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
-        self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id # 如果没有指定dataset.root 默认在huggingface cache目录下
 
         try:
             if force_cache_sync:
@@ -614,12 +614,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
-        if self.episodes is None:
+        if self.episodes is None: #* 这个参数用来控制训练具体的episode,例如【0,2,4,6】，默认为空，全都进行配置
             path = str(self.root / "data")
             hf_dataset = load_dataset("parquet", data_dir=path, split="train")
         else:
             files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            # 这个文件一共十列 Index(['action', 'observation.state', 'timestamp', 'frame_index', 'episode_index', 'index', 'task_index'], dtype='object')
+            hf_dataset = load_dataset("parquet", data_files=files, split="train") # 
 
         # TODO(aliberts): hf_dataset.set_format("torch")
         hf_dataset.set_transform(hf_transform_to_torch)
@@ -664,12 +665,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
         ep_start = self.episode_data_index["from"][ep_idx]
         ep_end = self.episode_data_index["to"][ep_idx]
+        # 这里为了从当前帧到当前帧后100帧的范围，界限是这个episode的上界和下界，ep_start 和 ep_end
         query_indices = {
             key: [max(ep_start.item(), min(ep_end.item() - 1, idx + delta)) for delta in delta_idx]
             for key, delta_idx in self.delta_indices.items()
         }
-        padding = {  # Pad values outside of current episode range
-            f"{key}_is_pad": torch.BoolTensor(
+        padding = {  # pad mask， 补充indice不够的地方 如果在范围内的为False，超出范围的为True
+            f"{key}_is_pad": torch.BoolTensor( 
                 [(idx + delta < ep_start.item()) | (idx + delta >= ep_end.item()) for delta in delta_idx]
             )
             for key, delta_idx in self.delta_indices.items()
@@ -706,6 +708,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         item = {}
         for vid_key, query_ts in query_timestamps.items():
+            # observation 保存在so100_test/videos/chunk-000/observation.images.third_view/
+            # 根据 timestamp 读取视频帧 取出一张图片，torch.Size([3, 480, 640])
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
             frames = decode_video_frames_torchvision(
                 video_path, query_ts, self.tolerance_s, self.video_backend
@@ -727,13 +731,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
         ep_idx = item["episode_index"].item()
 
         query_indices = None
+        # get action chunk
         if self.delta_indices is not None:
             query_indices, padding = self._get_query_indices(idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
+            query_result = self._query_hf_dataset(query_indices) # chunk_size, 6 torch.Size([100, 6]) 
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
-
+        
+        # get video mp4 frames 
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)

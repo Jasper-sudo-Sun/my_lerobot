@@ -201,12 +201,12 @@ def train(cfg: TrainPipelineConfig):
     )
 
     logging.info("Start offline training on a fixed dataset")
-    for _ in range(step, cfg.steps):
+    for _ in range(step, cfg.steps): # 100000
         start_time = time.perf_counter()
         batch = next(dl_iter)
         train_tracker.dataloading_s = time.perf_counter() - start_time
-
-        for key in batch:
+        # ? observation.state and timestamp in batch
+        for key in batch:  # trans data to cuda 
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(device, non_blocking=True)
 
