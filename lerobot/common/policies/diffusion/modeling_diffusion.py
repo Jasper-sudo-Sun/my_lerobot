@@ -111,11 +111,11 @@ class DiffusionPolicy(PreTrainedPolicy):
           - `n_action_steps` worth of actions are actually kept for execution, starting from the current step.
         Schematically this looks like:
             ----------------------------------------------------------------------------------------------
-            (legend: o = n_obs_steps, h = horizon, a = n_action_steps)
+            (legend: o = 观测序列的数量，也就是多帧, h = 每次预测的数量这里是16, a = 预测这么多保存的数量是8)
             |timestep            | n-o+1 | n-o+2 | ..... | n     | ..... | n+a-1 | n+a   | ..... | n-o+h |
             |observation is used | YES   | YES   | YES   | YES   | NO    | NO    | NO    | NO    | NO    |
-            |action is generated | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   |
-            |action is used      | NO    | NO    | NO    | YES   | YES   | YES   | NO    | NO    | NO    |
+            |action is generated | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   | # 预测的action 的位置是从n - o + 1开始
+            |action is used      | NO    | NO    | NO    | YES   | YES   | YES   | NO    | NO    | NO    | # 实际用的应该是从当前帧开始的向后 a 帧，从第n帧到n + a - 1 
             ----------------------------------------------------------------------------------------------
         Note that this means we require: `n_action_steps <= horizon - n_obs_steps + 1`. Also, note that
         "horizon" may not the best name to describe what the variable actually means, because this period is
@@ -129,7 +129,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             )
         # Note: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
-
+        #!!!!!!! 这里直到队列为空才继续生成action， 否则只执行之前生成的action序列，例如数量为8
         if len(self._queues["action"]) == 0:
             # stack n latest observations from the queue
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
@@ -139,7 +139,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             actions = self.unnormalize_outputs({"action": actions})["action"]
 
             self._queues["action"].extend(actions.transpose(0, 1))
-
+        #* 取出最前面的action，每次取一个，直到取完8个再次生成
         action = self._queues["action"].popleft()
         return action
 
@@ -237,12 +237,12 @@ class DiffusionModel(nn.Module):
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode image features and concatenate them all together along with the state vector."""
+        """diffusion 利用时序信息，每次加载两个图片，所以观测的机械臂状态和图像都是两个，torch.Size([8, 2, 3, 480, 640])"""
         batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
         global_cond_feats = [batch[OBS_ROBOT]]
         # Extract image features.
         if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
+            if self.config.use_separate_rgb_encoder_per_camera: # 如果对每个都有一个encoder
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
                 images_per_camera = einops.rearrange(batch["observation.images"], "b s n ... -> n (b s) ...")
                 img_features_list = torch.cat(
@@ -272,6 +272,7 @@ class DiffusionModel(nn.Module):
             global_cond_feats.append(batch[OBS_ENV])
 
         # Concatenate features then flatten to (B, global_cond_dim).
+        #* global_cond_feats = [observation.state, observation.images, observation.environment_state(optional)]
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
@@ -293,12 +294,12 @@ class DiffusionModel(nn.Module):
 
         # run sampling
         actions = self.conditional_sample(batch_size, global_cond=global_cond)
-
+        # action.shape = torch.Size([8, 16, 6])
         # Extract `n_action_steps` steps worth of actions (from the current observation).
-        start = n_obs_steps - 1
-        end = start + self.config.n_action_steps
+        start = n_obs_steps - 1 # o - 1
+        end = start + self.config.n_action_steps #  o - 1 + a
         actions = actions[:, start:end]
-
+        #! act 起始的预测帧是从视频输入帧开始的，所以要得到当前帧后面的a帧，要从预测的horizon帧中拿出属于当前帧后的a帧
         return actions
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
@@ -329,7 +330,7 @@ class DiffusionModel(nn.Module):
         # Forward diffusion.
         trajectory = batch["action"]
         # Sample noise to add to the trajectory.
-        eps = torch.randn(trajectory.shape, device=trajectory.device)
+        eps = torch.randn(trajectory.shape, device=trajectory.device) # 随即采样符合标准正态的噪声
         # Sample a random noising timestep for each item in the batch.
         timesteps = torch.randint(
             low=0,
@@ -342,7 +343,7 @@ class DiffusionModel(nn.Module):
 
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
         pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
-
+        #* 每次预测16个时间布的动作， 对应target也是torch.Size([8, 16, 6])
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
         if self.config.prediction_type == "epsilon":

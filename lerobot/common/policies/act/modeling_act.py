@@ -128,7 +128,7 @@ class ACTPolicy(PreTrainedPolicy):
         # If we are doing temporal ensembling, do online updates where we keep track of the number of actions
         # we are ensembling over.
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.model(batch)[0]  # (batch_size, chunk_size, action_dim)
+            actions = self.model(batch)[0]  #* 输出动作序列 (B, chunk_size, action_dim)
             actions = self.unnormalize_outputs({"action": actions})["action"]
             action = self.temporal_ensembler.update(actions)
             return action
@@ -232,7 +232,8 @@ class ACTTemporalEnsembler:
         self.ensembled_actions = None
         # (chunk_size,) count of how many actions are in the ensemble for each time step in the sequence.
         self.ensembled_actions_count = None
-
+        
+    #! 累计权重加权求和，注意这里是在线工作，先乘回带权重总和，再除以累计权重
     def update(self, actions: Tensor) -> Tensor:
         """
         Takes a (batch, chunk_size, action_dim) sequence of actions, update the temporal ensemble for all
