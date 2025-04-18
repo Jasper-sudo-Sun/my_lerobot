@@ -248,7 +248,7 @@ class PI0Policy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        self.language_tokenizer = AutoTokenizer.from_pretrained("/home/qianpusun/.cache/modelscope/hub/models/AI-ModelScope/paligemma-3b-pt-224")
         self.model = PI0FlowMatching(config)
 
         self.reset()
@@ -310,10 +310,10 @@ class PI0Policy(PreTrainedPolicy):
         batch = self.normalize_targets(batch)
 
         images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
-        lang_tokens, lang_masks = self.prepare_language(batch)
-        actions = self.prepare_action(batch)
-        actions_is_pad = batch.get("actions_is_pad")
+        state = self.prepare_state(batch) #? 这里把state pad成32维度了
+        lang_tokens, lang_masks = self.prepare_language(batch)   # torch.Size([8, 48])
+        actions = self.prepare_action(batch) # ?同样把action pad成32维度了
+        actions_is_pad = batch.get("actions_is_pad") #? 命名已经pad了，为什么为空
 
         loss_dict = {}
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
@@ -508,6 +508,16 @@ class PI0FlowMatching(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+        /
+        inputs:
+            images: list of image tensors num_images * (bsize x 3 x 224 x 224)
+            img_masks: list of image masks num_img_embs * (bsize)
+            lang_tokens: language tokens num_lang_embs * (bsize)
+            lang_masks: language masks num_lang_embs * (bsize)
+        outputs:
+            embs: concatenated image and language embeddings (bsize x num_embs x proj_width)
+            pad_masks: concatenated image and language masks (bsize x num_embs)
+            att_masks: attention masks for the transformer (bsize x num_embs)
         """
         # TODO: avoid list in python and torch.cat ; prefer pre-allocation with torch.empty
         embs = []
@@ -519,23 +529,23 @@ class PI0FlowMatching(nn.Module):
             img,
             img_mask,
         ) in zip(images, img_masks, strict=False):
-            img_emb = self.paligemma_with_expert.embed_image(img)
+            img_emb = self.paligemma_with_expert.embed_image(img) # torch.Size([8, 256, 2048])
             img_emb = img_emb.to(dtype=torch.bfloat16)
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device) # ? why
 
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
             embs.append(img_emb)
-            pad_masks.append(img_mask)
+            pad_masks.append(img_mask) # torch.Size([8, 256])
 
             # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
+            att_masks += [0] * num_img_embs #! 这里是0，表示可以互相attend
 
-        lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+        lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens) # torch.Size([8, 48, 2048]) 48是pad以后的结果
 
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -550,19 +560,29 @@ class PI0FlowMatching(nn.Module):
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device) # 256 * 2 + 48 = 560
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+            inputs:
+                state: robot state (bsize x max_state_dim = 32)
+                noisy_actions: noisy actions (bsize x n_action_steps = 50 x max_action_dim = 32)
+                timestep: time step (bsize)
+            outputs:
+                embs: concatenated state and action embeddings (bsize x num_embs x proj_width)
+                pad_masks: concatenated state and action masks (bsize x num_embs)
+                att_masks: attention masks for the transformer (bsize x num_embs)
+        """
+        
         embs = []
         pad_masks = []
         att_masks = []
 
         # Embed state
-        state_emb = self.state_proj(state)
+        state_emb = self.state_proj(state) # up to 1024 dim
         state_emb = state_emb.to(dtype=torch.bfloat16)
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]
@@ -585,11 +605,11 @@ class PI0FlowMatching(nn.Module):
         action_emb = self.action_in_proj(noisy_actions)
 
         time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2) #! torch.Size([8, 50, 2048]) 在最后一个维度进行拼接，对每个action加上他的时序信息
 
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)  # swish == silu
-        action_time_emb = self.action_time_mlp_out(action_time_emb)
+        action_time_emb = self.action_time_mlp_out(action_time_emb) 
 
         # Add to input tokens
         embs.append(action_time_emb)
@@ -599,7 +619,7 @@ class PI0FlowMatching(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.n_action_steps - 1))
+        att_masks += [1] + ([0] * (self.config.n_action_steps - 1)) #? 为什么低一个为1
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -630,7 +650,7 @@ class PI0FlowMatching(nn.Module):
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks) #TODO: 还需要需学习
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         (_, suffix_out), _ = self.paligemma_with_expert.forward(
